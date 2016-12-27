@@ -5,7 +5,7 @@ const ECHO: &'static [u8] =
 
 fn handle_stream(mut stream: TcpStream) {
     println!("incoming.");
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 5];
     const CRLF_CRLF: [u8; 4] = [b'\r', b'\n', b'\r', b'\n'];
     let mut match_count = 0;
     let mut history = Vec::<u8>::new();
@@ -26,14 +26,16 @@ fn handle_stream(mut stream: TcpStream) {
                     first_line = false;
                     println!("history length {} idx {}, now:", history.len(), idx);
                     fn mapping(&x: &u8) -> String { (x as char).escape_default().collect() };
-                    println!("{}", history.iter().map(&mapping).collect::<String>());
+                    print!("{}", history.iter().map(&mapping).collect::<String>());
                     println!("{}", buf[..idx + 1].iter().map(mapping).collect::<String>());
                 }
             } else {
                 match_count = 0;
             }
         }
-        history.extend(&buf);
+        if first_line {
+            history.extend(&buf[..n]);
+        }
         if match_count > 0 {
             println!("{} matched", match_count);
         }
