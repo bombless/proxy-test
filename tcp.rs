@@ -10,6 +10,10 @@ struct HttpRequest {
 
 use std::fmt::{Formatter, Debug, Result as FmtResult};
 
+fn escape_bytestring(s: &[u8]) -> String {
+    s.iter().map(|&x| (x as char).escape_default().collect::<String>()).collect()
+}
+
 impl Debug for HttpRequest {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         try!(write!(f, "HttpRequest {{ starter: "));
@@ -72,11 +76,26 @@ fn handle_stream(mut stream: TcpStream) -> Result<HttpRequest, ()> {
     }
 }
 
+fn read_path(starter: &[u8]) ->Option<&[u8]> {
+    let mut gap = None;
+    for (idx, &c) in starter.iter().enumerate() {
+        if (c as char).is_whitespace() {
+            if let Some(s) = gap {
+                return Some(&starter[s..idx]);
+            }
+            gap = Some(idx + 1);
+        }
+    }
+    return None;
+}
+
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:3386").unwrap();
     for stream in listener.incoming() {
         println!("incoming.");
-        println!("{:?}", handle_stream(stream.unwrap()));
+        if let Ok(r) = handle_stream(stream.unwrap()) {
+            println!("path: {:?}", read_path(&r.starter).map(escape_bytestring));
+        }
         println!("done.");
     }
 }
