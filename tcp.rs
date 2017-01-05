@@ -76,17 +76,64 @@ fn handle_stream(mut stream: TcpStream) -> Result<HttpRequest, ()> {
     }
 }
 
-fn read_path(starter: &[u8]) ->Option<&[u8]> {
-    let mut gap = None;
-    for (idx, &c) in starter.iter().enumerate() {
-        if (c as char).is_whitespace() {
-            if let Some(s) = gap {
-                return Some(&starter[s..idx]);
-            }
-            gap = Some(idx + 1);
+impl HttpRequest {
+    
+    pub fn host(&self) -> Option<&[u8]> {
+
+        #[derive(PartialEq, Debug)]
+        enum Status {
+            None,
+            First,
+            Second,
+            Third,
+            Fourth,
+            Coloned,
+            Collecting,
+            Returned,
+
         }
+        let mut start = None;
+        let mut matched = Status::None;
+        for (idx, &c) in self.headers.iter().enumerate() {
+            println!("{:?}", matched);
+            if matched == Status::None && (c == b'H' || c == b'h') {
+                matched = Status::First;
+            } else if matched == Status::First && (c == b'O' || c == b'o') {
+                matched = Status::Second;
+            } else if matched == Status::Second && (c == b'S' || c == b's') {
+                matched = Status::Third;
+            } else if matched == Status::Third && (c == b'T' || c == b't') {
+                matched = Status::Fourth;
+            } else if matched == Status::Fourth && c == b':' {
+                matched = Status::Coloned;
+            } else if matched == Status::Coloned && c != b' ' {
+                start = Some(idx);
+                matched = Status::Collecting;
+            } else if matched == Status::Collecting && c == b'\r' {
+                matched = Status::Returned;
+            } else if matched == Status::Returned && c == b'\n' {
+                return Some(&self.headers[start.unwrap() .. idx - 1]);
+            } else if !(c == b' ' && (matched == Status::Fourth || matched == Status::Coloned)) && matched != Status::Collecting && matched != Status::Returned {
+                matched = Status::None;
+            } else if matched == Status::Returned && c != b'\r' {
+                matched = Status::Collecting;
+            }
+        }
+        None
     }
-    return None;
+
+    pub fn path(&self) -> Option<&[u8]> {
+        let mut gap = None;
+        for (idx, &c) in self.starter.iter().enumerate() {
+            if (c as char).is_whitespace() {
+                if let Some(s) = gap {
+                    return Some(&self.starter[s..idx]);
+                }
+                gap = Some(idx + 1);
+            }
+        }
+        return None;
+    }
 }
 
 fn main() {
@@ -94,7 +141,8 @@ fn main() {
     for stream in listener.incoming() {
         println!("incoming.");
         if let Ok(r) = handle_stream(stream.unwrap()) {
-            println!("path: {:?}", read_path(&r.starter).map(escape_bytestring));
+            println!("path: {:?}", r.path().map(escape_bytestring));
+            println!("host: {:?}", r.host().map(escape_bytestring));
         }
         println!("done.");
     }
