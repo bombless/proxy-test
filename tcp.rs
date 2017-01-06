@@ -1,7 +1,7 @@
 use std::net::*;
 use std::io::{Read, Write};
 const ECHO: &'static [u8] =
-    b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nhello";
+    b"HTTP/1.1 200 Connection Established\r\n\r\n";
 
 struct HttpRequest {
     starter: Vec<u8>,
@@ -37,7 +37,6 @@ fn handle_stream(mut stream: TcpStream) -> Result<HttpRequest, ()> {
     let mut first_line = None;
     'main_loop: loop {
         let n = if let Ok(n) = stream.read(&mut buf) {
-            println!("{} bytes read.", n);
             n
         } else {
             continue;
@@ -82,6 +81,7 @@ struct HeaderCatcher {
 }
 
 impl HeaderCatcher {
+
     pub fn new() -> Self {
         HeaderCatcher { match_count: 0 }
     }
@@ -103,7 +103,9 @@ impl HeaderCatcher {
 }
 
 fn proxy(mut req: HttpRequest) {
-    let mut stream = TcpStream::connect((std::str::from_utf8(req.host().unwrap()).unwrap(), 80)).unwrap();
+    let port = req.port().map(Vec::from);
+    println!("port {:?}", port.as_ref().map(|x| escape_bytestring(x)));
+    let mut stream = TcpStream::connect((std::str::from_utf8(&port.expect("host not found")).expect("non-UTF8 host"), 80)).expect("connection failed");
     stream.write(req.starter()).unwrap();
     stream.write(req.headers()).unwrap();
     let mut buf = [0; 7];
@@ -143,8 +145,7 @@ fn proxy(mut req: HttpRequest) {
                     }
                 }
             } else {
-                for (idx, &c) in buf[..n].iter().enumerate() {
-                    println!("{:?}", matched);
+                for &c in &buf[..n] {
                     if matched == Status::Start && (c as char).to_lowercase().next() != Some(CONTENT[0] as char) {
                         matched = Status::None;
                     } else if matched == Status::None && c == b'\r' {
@@ -190,6 +191,34 @@ fn proxy(mut req: HttpRequest) {
 }
 
 impl HttpRequest {
+
+    pub fn port(&self) -> Option<&[u8]> {
+
+        fn find(x: &[u8], c: u8) -> Option<usize> {
+            for (idx, &x) in x.iter().enumerate() {
+                if x == c {
+                    return Some(idx);
+                }
+            }
+            return None;
+        }
+
+        match self.host() {
+            x @ Some(_) => x,
+            _ => match self.path() {
+                Some(p) => {
+                    let len = "http://".len();
+                    let start = &p[len..];
+                    if let Some(offset) = find(start, b'/') {
+                        Some(&start[..offset])
+                    } else {
+                        None
+                    }
+                },
+                x => x
+            }
+        }
+    }
     
     pub fn host(&self) -> Option<&[u8]> {
 
@@ -209,7 +238,6 @@ impl HttpRequest {
         let mut start = None;
         let mut matched = Status::None;
         for (idx, &c) in self.headers.iter().enumerate() {
-            println!("{:?}", matched);
             if matched == Status::Start && !(c == b'H' || c == b'h') {
                 matched = Status::None;
             } else if matched == Status::None && c == b'\r' {
@@ -234,7 +262,7 @@ impl HttpRequest {
             } else if matched == Status::Collecting && c == b'\r' {
                 matched = Status::Returned;
             } else if matched == Status::Returned && c == b'\n' {
-                return Some(&self.headers[start.unwrap() .. idx - 1]);
+                return Some(&self.headers[start.expect("null-start") .. idx - 1]);
             } else if !(c == b' ' && (matched == Status::Fourth || matched == Status::Coloned)) && matched != Status::Collecting && matched != Status::Returned {
                 matched = Status::None;
             } else if matched == Status::Returned && c != b'\r' {
@@ -276,14 +304,18 @@ impl HttpRequest {
 }
 
 fn main() {
-    let listener = TcpListener::bind("0.0.0.0:3386").unwrap();
+    let listener = TcpListener::bind("0.0.0.0:3386").expect("connection failed");
     for stream in listener.incoming() {
         println!("incoming.");
         if let Ok(mut r) = handle_stream(stream.unwrap()) {
             println!("method: {:?}", r.method().map(escape_bytestring));
             println!("path: {:?}", r.path().map(escape_bytestring));
             println!("host: {:?}", r.host().map(escape_bytestring));
-            proxy(r);
+            if r.method() == Some(b"CONNECT") {
+                r.stream.write(ECHO).expect("write failed");
+            } else {
+                proxy(r);
+            }            
         }
         println!("done.");
     }
