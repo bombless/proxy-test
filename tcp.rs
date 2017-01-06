@@ -6,6 +6,7 @@ const ECHO: &'static [u8] =
 struct HttpRequest {
     starter: Vec<u8>,
     headers: Vec<u8>,
+    stream: TcpStream,
 }
 
 use std::fmt::{Formatter, Debug, Result as FmtResult};
@@ -50,10 +51,10 @@ fn handle_stream(mut stream: TcpStream) -> Result<HttpRequest, ()> {
                         let mut headers = Vec::new();
                         headers.extend(&history);
                         headers.extend(&buf[..idx + 1]);
-                        stream.write(ECHO).unwrap();
                         return Ok(HttpRequest {
                             starter: starter,
                             headers: headers,
+                            stream: stream,
                         });
                     } else {
                         return Err(());
@@ -76,6 +77,118 @@ fn handle_stream(mut stream: TcpStream) -> Result<HttpRequest, ()> {
     }
 }
 
+struct HeaderCatcher {
+    match_count: usize,    
+}
+
+impl HeaderCatcher {
+    pub fn new() -> Self {
+        HeaderCatcher { match_count: 0 }
+    }
+
+    pub fn handle(&mut self, s: &[u8]) -> Option<usize> {
+        const CRLF_CRLF: [u8; 4] = [b'\r', b'\n', b'\r', b'\n'];
+        for (idx, &c) in s.iter().enumerate() {
+            if c == CRLF_CRLF[self.match_count] {
+                self.match_count += 1;
+                if self.match_count == 4 {
+                    return Some(idx);
+                }
+            } else {
+                self.match_count = 0;
+            }
+        }
+        return None;
+    }
+}
+
+fn proxy(mut req: HttpRequest) {
+    let mut stream = TcpStream::connect((std::str::from_utf8(req.host().unwrap()).unwrap(), 80)).unwrap();
+    stream.write(req.starter()).unwrap();
+    stream.write(req.headers()).unwrap();
+    let mut buf = [0; 7];
+    #[derive(PartialEq, Debug)]
+    enum Status {
+        None,
+        StartingReturn,
+        Start,
+        Content(usize),
+        WaitColon,
+        Coloned,
+        Collecting,
+        Returned,
+        Done,
+    }
+    let mut length: Option<usize> = None;
+    let mut matched = Status::None;
+    let mut collect = Vec::new();
+    const CONTENT: &'static [u8] = b"content-length";
+    let mut header_catcher = HeaderCatcher::new();
+    let mut length_count = 0;
+    loop {
+        if let Ok(n) = stream.read(&mut buf) {
+            req.stream.write(&buf[..n]).unwrap();
+            if length_count == 0 {
+                if let Some(offset) = header_catcher.handle(&buf[..n]) {
+                    length_count = n - offset;
+                }
+            } else {
+                length_count += n;
+            }
+
+            if Status::Done == matched {
+                if let Some(c) = length {
+                    if length_count >= c {
+                        break;
+                    }
+                }
+            } else {
+                for (idx, &c) in buf[..n].iter().enumerate() {
+                    println!("{:?}", matched);
+                    if matched == Status::Start && (c as char).to_lowercase().next() != Some(CONTENT[0] as char) {
+                        matched = Status::None;
+                    } else if matched == Status::None && c == b'\r' {
+                        matched = Status::StartingReturn;
+                    } else if matched == Status::StartingReturn && c == b'\n' {
+                        matched = Status::Start;
+                    } else if matched == Status::StartingReturn && c != b'\r' {
+                        matched = Status::None;
+                    } else if matched == Status::Start && (c as char).to_lowercase().next() == Some(CONTENT[0] as char) {
+                        matched = Status::Content(0);
+                    } else if let Status::Content(offset) = matched {
+                        if CONTENT[offset] == c {
+                            if offset == CONTENT.len() - 1 {
+                                matched = Status::WaitColon;
+                            } else {
+                                matched = Status::Content(offset + 1);
+                            }
+                        } else {
+                            matched = Status::None;
+                        }
+                    } else if matched == Status::Coloned && c != b' ' {
+                        matched = Status::Collecting;
+                        collect.clear();
+                        collect.push(c);
+                    } else if matched == Status::Collecting && c == b'\r' {
+                        matched = Status::Returned;
+                    } else if matched == Status::Returned && c == b'\n' {
+                        if let Ok(s) = std::str::from_utf8(&collect) {
+                            length = s.parse().ok();
+                            matched = Status::Done;
+                        }
+                    } else if matched == Status::Collecting {
+                        collect.push(c);
+                    } else if matched != Status::Returned {
+                        matched = Status::None;
+                    } else if matched == Status::Returned && c != b'\r' {
+                        matched = Status::Collecting;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl HttpRequest {
     
     pub fn host(&self) -> Option<&[u8]> {
@@ -83,6 +196,8 @@ impl HttpRequest {
         #[derive(PartialEq, Debug)]
         enum Status {
             None,
+            StartingReturn,
+            Start,
             First,
             Second,
             Third,
@@ -90,13 +205,20 @@ impl HttpRequest {
             Coloned,
             Collecting,
             Returned,
-
         }
         let mut start = None;
         let mut matched = Status::None;
         for (idx, &c) in self.headers.iter().enumerate() {
             println!("{:?}", matched);
-            if matched == Status::None && (c == b'H' || c == b'h') {
+            if matched == Status::Start && !(c == b'H' || c == b'h') {
+                matched = Status::None;
+            } else if matched == Status::None && c == b'\r' {
+                matched = Status::StartingReturn;
+            } else if matched == Status::StartingReturn && c == b'\n' {
+                matched = Status::Start;
+            } else if matched == Status::StartingReturn && c != b'\r' {
+                matched = Status::None;
+            } else if matched == Status::Start && (c == b'H' || c == b'h') {
                 matched = Status::First;
             } else if matched == Status::First && (c == b'O' || c == b'o') {
                 matched = Status::Second;
@@ -134,15 +256,34 @@ impl HttpRequest {
         }
         return None;
     }
+
+    pub fn method(&self) -> Option<&[u8]> {
+        for (idx, &c) in self.starter.iter().enumerate() {
+            if (c as char).is_whitespace() {
+                return Some(&self.starter[..idx]);
+            }
+        }
+        return None;
+    }
+
+    fn starter(&self) -> &[u8] {
+        &self.starter
+    }
+
+    fn headers(&self) -> &[u8] {
+        &self.headers
+    }
 }
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:3386").unwrap();
     for stream in listener.incoming() {
         println!("incoming.");
-        if let Ok(r) = handle_stream(stream.unwrap()) {
+        if let Ok(mut r) = handle_stream(stream.unwrap()) {
+            println!("method: {:?}", r.method().map(escape_bytestring));
             println!("path: {:?}", r.path().map(escape_bytestring));
             println!("host: {:?}", r.host().map(escape_bytestring));
+            proxy(r);
         }
         println!("done.");
     }
