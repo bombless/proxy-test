@@ -102,6 +102,80 @@ impl HeaderCatcher {
     }
 }
 
+#[derive(PartialEq, Debug)]
+enum HeaderCollector {
+    None,
+    StartingReturn,
+    Start,
+    Content(usize),
+    WaitColon,
+    Coloned,
+    Collecting {
+        collect: Vec<u8>
+    },
+    Returned {
+        collect: Vec<u8>
+    },
+    Done {
+        collect: Vec<u8>
+    },
+}
+
+impl HeaderCollector {
+    pub fn new() -> Self {
+        HeaderCollector::None
+    }
+    pub fn put(&mut self, c: u8) {
+        const CONTENT: &'static [u8] = b"content-length";
+        use HeaderCollector::*;
+        use std::mem::replace;
+        let this = replace(self, None);
+
+        replace(self, match this {
+            None if c == b'\r' => StartingReturn,
+            StartingReturn if c == b'\n' => Start,
+            StartingReturn if c == b'\r' => None,
+            Start  => if (c as char).to_lowercase().next() == Some(CONTENT[0] as char) {
+                    Content(1)
+                } else {
+                None
+            },
+            Content(offset) => if Some(CONTENT[offset] as char) == (c as char).to_lowercase().next() {
+                if offset == CONTENT.len() - 1 {
+                    WaitColon
+                } else {
+                    Content(offset + 1)
+                }
+            } else {
+                None
+            },
+            WaitColon if c == b' ' => WaitColon,
+            WaitColon if c == b':' => Coloned,
+            Coloned => if c == b' ' { Coloned } else {
+                Collecting { collect: vec![c] }
+            },
+            Collecting { ref collect } if c == b'\r' => {
+                Returned { collect: collect.clone() }
+            },
+            Collecting { mut collect } => {
+                collect.push(c);
+                Collecting { collect: collect }
+            },
+            Returned { mut collect } => if c == b'\n'{
+                Done { collect: collect }
+            } else {
+                collect.push(b'\r');
+                if c == b'\r' {
+                    Returned { collect: collect }
+                } else {
+                    Collecting { collect: collect }
+                }
+            },
+            _ => None,
+        });
+    }
+}
+
 fn proxy(mut req: HttpRequest) {
     let port = req.port().map(Vec::from);
     println!("port {:?}", port.as_ref().map(|x| escape_bytestring(x)));
@@ -109,23 +183,10 @@ fn proxy(mut req: HttpRequest) {
     stream.write(req.starter()).unwrap();
     stream.write(req.headers()).unwrap();
     let mut buf = [0; 7];
-    #[derive(PartialEq, Debug)]
-    enum Status {
-        None,
-        StartingReturn,
-        Start,
-        Content(usize),
-        WaitColon,
-        Coloned,
-        Collecting,
-        Returned,
-        Done,
-    }
+
     let mut length: Option<usize> = None;
-    let mut matched = Status::None;
-    let mut collect = Vec::new();
-    const CONTENT: &'static [u8] = b"content-length";
     let mut header_catcher = HeaderCatcher::new();
+    let mut header_collector = HeaderCollector::new();
     let mut length_count = 0;
     loop {
         if let Ok(n) = stream.read(&mut buf) {
@@ -138,51 +199,18 @@ fn proxy(mut req: HttpRequest) {
                 length_count += n;
             }
 
-            if Status::Done == matched {
-                if let Some(c) = length {
-                    if length_count >= c {
-                        break;
-                    }
+            if let Some(c) = length {
+                if length_count >= c {
+                    break;
                 }
             } else {
                 for &c in &buf[..n] {
-                    if matched == Status::Start && (c as char).to_lowercase().next() != Some(CONTENT[0] as char) {
-                        matched = Status::None;
-                    } else if matched == Status::None && c == b'\r' {
-                        matched = Status::StartingReturn;
-                    } else if matched == Status::StartingReturn && c == b'\n' {
-                        matched = Status::Start;
-                    } else if matched == Status::StartingReturn && c != b'\r' {
-                        matched = Status::None;
-                    } else if matched == Status::Start && (c as char).to_lowercase().next() == Some(CONTENT[0] as char) {
-                        matched = Status::Content(0);
-                    } else if let Status::Content(offset) = matched {
-                        if CONTENT[offset] == c {
-                            if offset == CONTENT.len() - 1 {
-                                matched = Status::WaitColon;
-                            } else {
-                                matched = Status::Content(offset + 1);
-                            }
-                        } else {
-                            matched = Status::None;
-                        }
-                    } else if matched == Status::Coloned && c != b' ' {
-                        matched = Status::Collecting;
-                        collect.clear();
-                        collect.push(c);
-                    } else if matched == Status::Collecting && c == b'\r' {
-                        matched = Status::Returned;
-                    } else if matched == Status::Returned && c == b'\n' {
-                        if let Ok(s) = std::str::from_utf8(&collect) {
+                    header_collector.put(c);
+                    if let HeaderCollector::Done { ref collect } = header_collector {
+                        if let Ok(s) = std::str::from_utf8(collect) {
                             length = s.parse().ok();
-                            matched = Status::Done;
+                            println!("content length {:?}", length)
                         }
-                    } else if matched == Status::Collecting {
-                        collect.push(c);
-                    } else if matched != Status::Returned {
-                        matched = Status::None;
-                    } else if matched == Status::Returned && c != b'\r' {
-                        matched = Status::Collecting;
                     }
                 }
             }
@@ -313,9 +341,12 @@ fn main() {
             println!("host: {:?}", r.host().map(escape_bytestring));
             if r.method() == Some(b"CONNECT") {
                 r.stream.write(ECHO).expect("write failed");
+                println!("replied CONNECT");
             } else {
+                println!("going proxy");
                 proxy(r);
-            }            
+                println!("done proxy");
+            }
         }
         println!("done.");
     }
