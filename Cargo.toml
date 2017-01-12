@@ -1,0 +1,10 @@
+[package]
+name = "proxy-test"
+version = "0.1.0"
+authors = ["York Xiang <bombless@126.com>"]
+
+[[bin]]
+name = "main"
+path = "tcp.rs"
+
+[dependencies]
